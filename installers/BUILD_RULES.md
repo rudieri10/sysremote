@@ -31,3 +31,7 @@ O instalador permite selecionar o tipo de instalação:
    ```
 
 **Nota:** Não utilize os scripts antigos (`host.iss`, `viewer.iss`) para distribuição final. Use sempre o `SysRemoteUnified.iss`.
+
+
+
+cargo build --release

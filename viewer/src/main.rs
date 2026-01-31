@@ -7,6 +7,9 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+mod discovery;
+use discovery::DiscoveryClient;
+
 const PSK: &str = "mysecretpassword";
 const KEY_BYTES: [u8; 32] = [0x42; 32];
 
@@ -28,18 +31,25 @@ struct ViewerApp {
     tx_input: Option<tokio::sync::mpsc::Sender<InputEvent>>,
     is_connected: bool,
     held_buttons: std::collections::HashSet<MouseButton>,
+    discovery: DiscoveryClient,
+    conn_req_rx: Option<std::sync::mpsc::Receiver<(String, u16)>>,
 }
 
 impl ViewerApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let discovery = DiscoveryClient::new();
+        discovery.start();
+        
         Self {
-            host_ip: "127.0.0.1:5599".to_owned(),
+            host_ip: "".to_owned(),
             status: "Disconnected".to_owned(),
             texture: None,
             latest_image: Arc::new(Mutex::new(None)),
             tx_input: None,
             is_connected: false,
             held_buttons: std::collections::HashSet::new(),
+            discovery,
+            conn_req_rx: None,
         }
     }
 
@@ -153,15 +163,76 @@ impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             if !self.is_connected {
-                ui.horizontal(|ui| {
-                    ui.label("Host IP:");
-                    ui.text_edit_singleline(&mut self.host_ip);
-                    if ui.button("Connect").clicked() {
-                        self.connect(ctx.clone());
+                ui.heading("Available Hosts");
+                ui.label(format!("Status: {}", self.discovery.get_status()));
+                
+                let hosts = self.discovery.get_hosts();
+                
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Hostname").strong());
+                        ui.add_space(20.0);
+                        ui.label(egui::RichText::new("Status").strong());
+                        ui.add_space(20.0);
+                        ui.label(egui::RichText::new("Action").strong());
+                    });
+                    ui.separator();
+
+                    for host in hosts {
+                        ui.horizontal(|ui| {
+                            ui.label(&host.hostname);
+                            ui.add_space(20.0);
+                            
+                            let color = if host.status == "online" { egui::Color32::GREEN } else { egui::Color32::RED };
+                            ui.colored_label(color, &host.status);
+                            ui.add_space(20.0);
+
+                            if host.status == "online" {
+                                if ui.button("Connect").clicked() {
+                                    let host_id = host.host_id.clone();
+                                    self.status = format!("Requesting connection to {}...", host.hostname);
+                                    
+                                    let (tx, rx) = std::sync::mpsc::channel();
+                                    self.conn_req_rx = Some(rx);
+                                    
+                                    // Clone discovery to pass to task if needed, but DiscoveryClient is new-able
+                                    // We create a new client for request because `request_connection` is on `DiscoveryClient`
+                                    // and `self.discovery` is inside `self` which is borrowed.
+                                    // Actually `DiscoveryClient` has Arc internals, so cloning it is cheap if we derived Clone.
+                                    // But I didn't derive Clone. Let's just create a new one as it's stateless except for shared Arcs.
+                                    // Wait, `DiscoveryClient::new()` creates NEW Arcs. So it doesn't share state.
+                                    // But `request_connection` creates a NEW socket connection, so it doesn't need shared state!
+                                    // So `DiscoveryClient::new()` is fine.
+                                    
+                                    tokio::spawn(async move {
+                                        let client = DiscoveryClient::new();
+                                        match client.request_connection(host_id).await {
+                                            Ok((ip, port)) => {
+                                                let _ = tx.send((ip, port));
+                                            }
+                                            Err(e) => {
+                                                // Handle error (maybe send empty or error msg via another channel?)
+                                                // For now just print
+                                                eprintln!("Connection request failed: {}", e);
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        });
                     }
                 });
-                ui.label(&self.status);
-            } else {
+
+                // Check for connection response
+                if let Some(rx) = &self.conn_req_rx {
+                    if let Ok((ip, port)) = rx.try_recv() {
+                        self.host_ip = format!("{}:{}", ip, port);
+                        self.conn_req_rx = None; // Clear receiver
+                        self.connect(ctx.clone());
+                    }
+                }
+                 
+             } else {
                 // Update texture if new image available
                 if let Ok(mut guard) = self.latest_image.try_lock() {
                     if let Some(img) = guard.take() {
@@ -172,61 +243,82 @@ impl eframe::App for ViewerApp {
 
                 if let Some(texture) = &self.texture {
                     // Show image and capture input
-                    let response = ui.add(egui::Image::new(texture));
-
-                    // Input Handling
-                    if let Some(tx) = &self.tx_input {
-                        // Mouse Movement
-                        if response.hovered() || !self.held_buttons.is_empty() {
-                            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                                let relative_x = pos.x - response.rect.min.x;
-                                let relative_y = pos.y - response.rect.min.y;
-
-                                let texture_size = texture.size();
-                                let scale_x = texture_size[0] as f32 / response.rect.width();
-                                let scale_y = texture_size[1] as f32 / response.rect.height();
-
-                                let final_x = (relative_x * scale_x) as i32;
-                                let final_y = (relative_y * scale_y) as i32;
-
-                                let _ = tx.try_send(InputEvent::MouseMove {
-                                    x: final_x,
-                                    y: final_y,
-                                });
-                            }
-                        }
-
-                        // Mouse Buttons (Drag Support)
-                        let pointer_state = ui.input(|i| i.pointer.clone());
-
-                        let mut check_button =
-                            |egui_btn: egui::PointerButton, remote_btn: MouseButton| {
-                                if pointer_state.button_down(egui_btn) {
-                                    if !self.held_buttons.contains(&remote_btn) {
-                                        // Only start click if we are hovering the image
-                                        if response.hovered() {
-                                            let _ = tx.try_send(InputEvent::MouseDown {
-                                                button: remote_btn.clone(),
-                                            });
-                                            self.held_buttons.insert(remote_btn);
-                                        }
-                                    }
-                                } else {
-                                    if self.held_buttons.contains(&remote_btn) {
-                                        let _ = tx.try_send(InputEvent::MouseUp {
-                                            button: remote_btn.clone(),
+                    // We need to scale the image to fit the window while maintaining aspect ratio
+                    let available_size = ui.available_size();
+                    let texture_size = texture.size_vec2();
+                    
+                    let scale_x = available_size.x / texture_size.x;
+                    let scale_y = available_size.y / texture_size.y;
+                    let scale = scale_x.min(scale_y); // Fit within window
+                    
+                    let final_size = texture_size * scale;
+                    
+                    // Center the image
+                    let x_offset = (available_size.x - final_size.x) / 2.0;
+                    let y_offset = (available_size.y - final_size.y) / 2.0;
+                    
+                    // Centering hack:
+                    ui.vertical(|ui| {
+                        ui.add_space(y_offset);
+                        ui.horizontal(|ui| {
+                            ui.add_space(x_offset);
+                            let response = ui.add(egui::Image::new(texture).fit_to_exact_size(final_size));
+                            
+                            // Input Handling
+                            if let Some(tx) = &self.tx_input {
+                                // Mouse Movement
+                                if response.hovered() || !self.held_buttons.is_empty() {
+                                    if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                        // Calculate relative position within the image rect
+                                        let relative_x = pos.x - response.rect.min.x;
+                                        let relative_y = pos.y - response.rect.min.y;
+                                        
+                                        // Scale back to original texture coordinates
+                                        let final_x = (relative_x / scale) as i32;
+                                        let final_y = (relative_y / scale) as i32;
+        
+                                        let _ = tx.try_send(InputEvent::MouseMove {
+                                            x: final_x,
+                                            y: final_y,
                                         });
-                                        self.held_buttons.remove(&remote_btn);
                                     }
                                 }
-                            };
-
-                        check_button(egui::PointerButton::Primary, MouseButton::Left);
-                        check_button(egui::PointerButton::Secondary, MouseButton::Right);
-                        check_button(egui::PointerButton::Middle, MouseButton::Middle);
+        
+                                // Mouse Buttons (Drag Support)
+                                let pointer_state = ui.input(|i| i.pointer.clone());
+        
+                                let mut check_button =
+                                    |egui_btn: egui::PointerButton, remote_btn: MouseButton| {
+                                        if pointer_state.button_down(egui_btn) {
+                                            if !self.held_buttons.contains(&remote_btn) {
+                                                // Only start click if we are hovering the image
+                                                if response.hovered() {
+                                                    let _ = tx.try_send(InputEvent::MouseDown {
+                                                        button: remote_btn.clone(),
+                                                    });
+                                                    self.held_buttons.insert(remote_btn);
+                                                }
+                                            }
+                                        } else {
+                                            if self.held_buttons.contains(&remote_btn) {
+                                                let _ = tx.try_send(InputEvent::MouseUp {
+                                                    button: remote_btn.clone(),
+                                                });
+                                                self.held_buttons.remove(&remote_btn);
+                                            }
+                                        }
+                                    };
+        
+                                check_button(egui::PointerButton::Primary, MouseButton::Left);
+                                check_button(egui::PointerButton::Secondary, MouseButton::Right);
+                                check_button(egui::PointerButton::Middle, MouseButton::Middle);
+                            }
+                        });
+                    });
 
                         // Keyboard (Advanced)
                         // Process raw key events
+                        if let Some(tx) = &self.tx_input {
                         for event in &ui.input(|i| i.events.clone()) {
                             match event {
                                 egui::Event::Key {
@@ -253,7 +345,7 @@ impl eframe::App for ViewerApp {
                                 _ => {}
                             }
                         }
-                    }
+                        }
                 } else {
                     ui.label("Waiting for video...");
                 }

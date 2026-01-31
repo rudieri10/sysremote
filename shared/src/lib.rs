@@ -8,6 +8,60 @@ use thiserror::Error;
 
 pub const DEFAULT_PORT: u16 = 5599;
 
+// --- Discovery Protocol Structs ---
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
+pub enum DiscoveryMessage {
+    #[serde(rename = "register_host")]
+    RegisterHost {
+        host_id: String,
+        hostname: String,
+        ip: String,
+        user: String,
+        os: String,
+    },
+    #[serde(rename = "heartbeat")]
+    Heartbeat {
+        host_id: String,
+    },
+    #[serde(rename = "list_hosts")]
+    ListHosts {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewer_id: Option<String>,
+    },
+    #[serde(rename = "host_list")]
+    HostList {
+        hosts: Vec<HostInfo>,
+    },
+    #[serde(rename = "connect_request")]
+    ConnectRequest {
+        viewer_id: String,
+        host_id: String,
+    },
+    #[serde(rename = "connect_response")]
+    ConnectResponse {
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        host_ip: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        host_port: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HostInfo {
+    pub host_id: String,
+    pub hostname: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+}
+
+// --- End Discovery Protocol Structs ---
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum NetworkMessage {
     Handshake { psk: String },

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SysRemote Logs</title>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .nav { margin-bottom: 20px; }
+        .nav a { margin-right: 15px; text-decoration: none; color: blue; }
+    </style>
+</head>
+<body>
+    <div class="nav">
+        <a href="/admin">Hosts</a>
+        <a href="/logs">Logs</a>
+    </div>
+    
+    <h1>Connection Logs</h1>
+    
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Viewer ID</th>
+                <th>Host ID</th>
+                <th>Start Time</th>
+                <th>End Time</th>
+                <th>Duration (s)</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for session in sessions %}
+            <tr>
+                <td>{{ session['id'] }}</td>
+                <td>{{ session['viewer_id'] }}</td>
+                <td>{{ session['host_id'] }}</td>
+                <td>{{ session['start_time'] }}</td>
+                <td>{{ session['end_time'] }}</td>
+                <td>{{ session['duration'] }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>
