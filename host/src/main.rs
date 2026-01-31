@@ -19,7 +19,7 @@ use windows_service::{
     define_windows_service,
     service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
-        ServiceType,
+        ServiceType, SessionChangeReason, SessionNotification,
     },
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
@@ -29,6 +29,7 @@ use xcap::Monitor;
 define_windows_service!(ffi_service_main, my_service_main);
 
 static STOP_SERVICE: AtomicBool = AtomicBool::new(false);
+static SESSION_CHANGED: AtomicBool = AtomicBool::new(false);
 static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 static AGENT_PROCESS_PID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
 
@@ -45,6 +46,18 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<()> {
                 STOP_SERVICE.store(true, Ordering::SeqCst);
                 ServiceControlHandlerResult::NoError
             }
+            ServiceControl::SessionChange(change) => {
+                log_info(&format!("Session Change detected: {:?} (Session ID: {:?})", change.reason, change.notification.session_id));
+                match change.reason {
+                    SessionChangeReason::ConsoleConnect
+                    | SessionChangeReason::SessionLogon
+                    | SessionChangeReason::RemoteConnect => {
+                        SESSION_CHANGED.store(true, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+                ServiceControlHandlerResult::NoError
+            }
             _ => ServiceControlHandlerResult::NotImplemented,
         }
     };
@@ -54,7 +67,7 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<()> {
     let next_status = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP,
+        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SESSION_CHANGE,
         exit_code: ServiceExitCode::Win32(0),
         checkpoint: 0,
         wait_hint: Duration::default(),
@@ -81,6 +94,16 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<()> {
     while !STOP_SERVICE.load(Ordering::SeqCst) {
         if let Some(lock) = AGENT_PROCESS_PID.get() {
             let mut guard = lock.lock().unwrap();
+
+            // Check if session changed
+            if SESSION_CHANGED.swap(false, Ordering::SeqCst) {
+                if let Some(pid) = *guard {
+                    log_info(&format!("Session changed. Killing old agent pid={}", pid));
+                    kill_process(pid);
+                    *guard = None;
+                }
+            }
+
             let needs_restart = match *guard {
                 None => true,
                 Some(pid) => !is_pid_running(pid),
@@ -109,17 +132,7 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<()> {
 
     if let Some(lock) = AGENT_PROCESS_PID.get() {
         if let Some(pid) = lock.lock().unwrap().take() {
-            unsafe {
-                let proc = winapi::um::processthreadsapi::OpenProcess(
-                    winapi::um::winnt::PROCESS_TERMINATE,
-                    0,
-                    pid,
-                );
-                if !proc.is_null() {
-                    let _ = winapi::um::processthreadsapi::TerminateProcess(proc, 0);
-                    winapi::um::handleapi::CloseHandle(proc);
-                }
-            }
+            kill_process(pid);
         }
     }
 
@@ -272,6 +285,20 @@ fn tail_logs_blocking() -> Result<()> {
     }
 }
 
+fn kill_process(pid: u32) {
+    unsafe {
+        let proc = winapi::um::processthreadsapi::OpenProcess(
+            winapi::um::winnt::PROCESS_TERMINATE,
+            0,
+            pid,
+        );
+        if !proc.is_null() {
+            let _ = winapi::um::processthreadsapi::TerminateProcess(proc, 0);
+            winapi::um::handleapi::CloseHandle(proc);
+        }
+    }
+}
+
 fn spawn_agent_in_active_session() -> Result<u32> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
@@ -281,15 +308,15 @@ fn spawn_agent_in_active_session() -> Result<u32> {
 
         let session_id = winapi::um::winbase::WTSGetActiveConsoleSessionId();
         if session_id == 0xFFFFFFFF {
-            anyhow::bail!("No active console session");
+            anyhow::bail!("No active console session found (WTSGetActiveConsoleSessionId returned -1)");
         }
+        
+        log_info(&format!("Attempting to spawn agent in Session {}", session_id));
 
         let mut user_token: winapi::um::winnt::HANDLE = std::ptr::null_mut();
         if winapi::um::wtsapi32::WTSQueryUserToken(session_id, &mut user_token) == 0 {
-            anyhow::bail!(
-                "WTSQueryUserToken failed (err={})",
-                winapi::um::errhandlingapi::GetLastError()
-            );
+            let err = winapi::um::errhandlingapi::GetLastError();
+            anyhow::bail!("WTSQueryUserToken failed for session {}: {}", session_id, err);
         }
 
         let mut primary_token: winapi::um::winnt::HANDLE = std::ptr::null_mut();
@@ -397,6 +424,7 @@ unsafe fn enable_privileges_for_create_process_as_user() -> Result<()> {
             "SeIncreaseQuotaPrivilege",
             "SeAssignPrimaryTokenPrivilege",
             "SeTcbPrivilege",
+            "SeDebugPrivilege",
         ] {
             let name_w = wide_string(name);
             let mut luid: winapi::um::winnt::LUID = std::mem::zeroed();
