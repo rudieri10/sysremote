@@ -43,6 +43,16 @@ pub enum DiscoveryMessage {
     ConnectRequest {
         viewer_id: String,
         host_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewer_ip: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewer_port: Option<u16>,
+    },
+    #[serde(rename = "reverse_connect")]
+    ReverseConnect {
+        viewer_ip: String,
+        viewer_port: u16,
+        viewer_id: String,
     },
     #[serde(rename = "connect_response")]
     ConnectResponse {

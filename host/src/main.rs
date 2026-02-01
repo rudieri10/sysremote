@@ -18,6 +18,7 @@ mod shmem_utils;
 use logging::{init_log, log_error, log_info, log_path};
 use std::time::{Duration, Instant};
 use std::io::Read;
+use std::os::windows::io::FromRawHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::net::windows::named_pipe::{ServerOptions, NamedPipeServer};
@@ -99,6 +100,15 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<()> {
     // Create Runtime for Discovery
     let rt = tokio::runtime::Runtime::new().map_err(|e| anyhow::anyhow!("Failed to create runtime: {}", e))?;
 
+    // Initialize IPC
+    let (shmem, pipe) = match rt.block_on(async { init_ipc().await }) {
+        Ok(res) => res,
+        Err(e) => {
+             log_error(&format!("Failed to initialize IPC: {}", e));
+             return Err(e);
+        }
+    };
+
     // Blocking Discovery Registration (must happen before main loop)
     log_info("Attempting to connect to discovery server...");
     if let Err(e) = rt.block_on(discovery::ensure_initial_registration()) {
@@ -109,13 +119,17 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<()> {
     log_info("Discovery registration successful.");
 
     // Start Discovery Service (Maintenance in background)
-    rt.spawn(async {
-        discovery::start_discovery_service().await;
+    let p1 = pipe.clone();
+    let s1 = shmem.clone();
+    rt.spawn(async move {
+        discovery::start_discovery_service(p1, s1).await;
     });
 
     // Start Host Server
-    rt.spawn(async {
-        if let Err(e) = run_server().await {
+    let p2 = pipe.clone();
+    let s2 = shmem.clone();
+    rt.spawn(async move {
+        if let Err(e) = run_server(p2, s2).await {
             log_error(&format!("Host server error: {}", e));
         }
     });
@@ -924,24 +938,7 @@ fn wide_string(s: &str) -> Vec<u16> {
         .collect()
 }
 
-async fn run_server() -> Result<()> {
-    let addr = format!("0.0.0.0:{}", DEFAULT_PORT);
-    log_info(&format!("Host trying to bind on {}", addr));
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => {
-            log_info(&format!("Host successfully bound to {}", addr));
-            if let Ok(actual) = l.local_addr() {
-                log_info(&format!("Host listening on {}", actual));
-            }
-            l
-        }
-        Err(e) => {
-            log_error(&format!("Failed to bind to {}: {}", addr, e));
-            return Err(e.into());
-        }
-    };
-
-    // --- IPC SETUP ---
+async fn init_ipc() -> Result<(Arc<Mutex<shmem_utils::Shmem>>, Arc<tokio::sync::Mutex<NamedPipeServer>>)> {
     log_info("Initializing IPC (Shared Memory & Pipe)...");
     log_info(&format!(
         "IPC names: pipe={} shmem={} shmem_size={}",
@@ -959,31 +956,110 @@ async fn run_server() -> Result<()> {
     };
     let shmem = Arc::new(Mutex::new(shmem));
 
-    // Create Named Pipe Server
-    let mut pipe_server = match ServerOptions::new().create(IPC_PIPE_NAME) {
-        Ok(p) => p,
+    // Create Named Pipe Server with security descriptor allowing user sessions
+    let pipe_server = {
+        use std::os::windows::ffi::OsStrExt;
+        
+         let sddl: Vec<u16> = std::ffi::OsStr::new("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sd: winapi::um::winnt::PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+
+        unsafe {
+            let res = winapi::shared::sddl::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                winapi::shared::sddl::SDDL_REVISION_1 as u32,
+                &mut sd,
+                std::ptr::null_mut(),
+            );
+            if res == 0 {
+                let err = winapi::um::errhandlingapi::GetLastError();
+                log_error(&format!("Failed to create security descriptor for pipe: {}", err));
+                return Err(anyhow::anyhow!("Pipe security descriptor failed: {}", err));
+            }
+        }
+
+        let mut sa: winapi::um::minwinbase::SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        sa.nLength = std::mem::size_of::<winapi::um::minwinbase::SECURITY_ATTRIBUTES>() as u32;
+        sa.lpSecurityDescriptor = sd;
+        sa.bInheritHandle = 0;
+
+        let pipe_name_w: Vec<u16> = std::ffi::OsStr::new(IPC_PIPE_NAME)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let handle = unsafe {
+            winapi::um::namedpipeapi::CreateNamedPipeW(
+                pipe_name_w.as_ptr(),
+                winapi::um::winbase::PIPE_ACCESS_DUPLEX | winapi::um::winbase::FILE_FLAG_OVERLAPPED,
+                winapi::um::winbase::PIPE_TYPE_BYTE | winapi::um::winbase::PIPE_READMODE_BYTE | winapi::um::winbase::PIPE_WAIT,
+                1,      // max instances
+                65536,  // out buffer size
+                65536,  // in buffer size
+                0,      // default timeout
+                &mut sa,
+            )
+        };
+
+        unsafe { winapi::um::winbase::LocalFree(sd as *mut _); }
+
+        if handle == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+            let err = unsafe { winapi::um::errhandlingapi::GetLastError() };
+            log_error(&format!("Failed to create IPC pipe {}: win32 error {}", IPC_PIPE_NAME, err));
+            return Err(anyhow::anyhow!("CreateNamedPipeW failed: {}", err));
+        }
+
+        log_info(&format!("Created IPC pipe {} with Everyone access", IPC_PIPE_NAME));
+        unsafe { NamedPipeServer::from_raw_handle(handle as std::os::windows::io::RawHandle) }.map_err(|e| anyhow::anyhow!("from_raw_handle failed: {}", e))
+    }?;
+
+    let pipe_server = Arc::new(tokio::sync::Mutex::new(pipe_server));
+    Ok((shmem, pipe_server))
+}
+
+async fn run_server(
+    pipe_server: Arc<tokio::sync::Mutex<NamedPipeServer>>,
+    shmem: Arc<Mutex<shmem_utils::Shmem>>,
+) -> Result<()> {
+    let addr = format!("0.0.0.0:{}", DEFAULT_PORT);
+    log_info(&format!("Host trying to bind on {}", addr));
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => {
+            log_info(&format!("Host successfully bound to {}", addr));
+            if let Ok(actual) = l.local_addr() {
+                log_info(&format!("Host listening on {}", actual));
+            }
+            l
+        }
         Err(e) => {
-            log_error(&format!("Failed to create IPC pipe {}: {}", IPC_PIPE_NAME, e));
+            log_error(&format!("Failed to bind to {}: {}", addr, e));
             return Err(e.into());
         }
     };
+
+    // IPC is passed in
     
     log_info("Waiting for Agent to connect on IPC pipe...");
     // Wait for agent
-    match tokio::time::timeout(Duration::from_secs(30), pipe_server.connect()).await {
-        Ok(res) => {
-            if let Err(e) = res {
-                log_error(&format!("Agent failed to connect to pipe: {}", e));
-            } else {
-                log_info("Agent connected to IPC!");
+    {
+        let mut pipe = pipe_server.lock().await;
+        match tokio::time::timeout(Duration::from_secs(30), pipe.connect()).await {
+            Ok(res) => {
+                if let Err(e) = res {
+                    log_error(&format!("Agent failed to connect to pipe: {}", e));
+                } else {
+                    log_info("Agent connected to IPC!");
+                }
             }
-        }
-        Err(_) => {
-            log_error("Timeout waiting for Agent connection.");
+            Err(_) => {
+                log_error("Timeout waiting for Agent connection.");
+            }
         }
     }
     
-    let pipe = Arc::new(tokio::sync::Mutex::new(pipe_server));
+    let pipe = pipe_server;
 
     log_info(&format!("Host listening loop started on {}", addr));
 
@@ -1011,7 +1087,7 @@ async fn run_server() -> Result<()> {
     }
 }
 
-async fn handle_client(
+pub(crate) async fn handle_client(
     mut socket: TcpStream,
     pipe: Arc<tokio::sync::Mutex<NamedPipeServer>>,
     shmem: Arc<Mutex<shmem_utils::Shmem>>,

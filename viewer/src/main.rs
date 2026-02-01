@@ -5,10 +5,17 @@ use openh264::formats::YUVSource;
 use shared::{Crypto, InputEvent, MouseButton, NetworkMessage, RemoteKey};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, TcpListener};
+use std::net::UdpSocket;
 
 mod discovery;
 use discovery::DiscoveryClient;
+
+fn get_local_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    socket.local_addr().ok().map(|addr| addr.ip().to_string())
+}
 
 const PSK: &str = "mysecretpassword";
 const KEY_BYTES: [u8; 32] = [0x42; 32];
@@ -32,7 +39,7 @@ struct ViewerApp {
     connection_state: Arc<Mutex<String>>,
     held_buttons: std::collections::HashSet<MouseButton>,
     discovery: DiscoveryClient,
-    conn_req_rx: Option<std::sync::mpsc::Receiver<(String, u16)>>,
+    conn_req_rx: Option<std::sync::mpsc::Receiver<(String, u16, Option<TcpListener>)>>,
 }
 
 impl ViewerApp {
@@ -53,7 +60,7 @@ impl ViewerApp {
         }
     }
 
-    fn connect(&mut self, ctx: egui::Context) {
+    fn connect(&mut self, ctx: egui::Context, listener: Option<TcpListener>) {
         let ip = self.host_ip.clone();
         let image_store = self.latest_image.clone();
         let conn_state = self.connection_state.clone();
@@ -68,10 +75,39 @@ impl ViewerApp {
         self.status = "Connecting...".to_owned();
         *conn_state.lock().unwrap() = "connecting".to_string();
 
+        let listen_info = if let Some(l) = &listener {
+            l.local_addr().ok().map(|a| format!(" (Reverse listening on {})", a)).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let status_msg = format!("Connecting to {}{}...", ip, listen_info);
+        self.status = status_msg.clone();
+
         tokio::spawn(async move {
-            println!("Connecting to {}...", ip);
+            println!("{}", status_msg);
             let result = async {
-                let mut socket = TcpStream::connect(&ip).await?;
+                let mut socket = if let Some(l) = listener {
+                    tokio::select! {
+                        res = TcpStream::connect(&ip) => {
+                            match res {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    println!("Direct connection failed ({}), waiting for reverse connection...", e);
+                                    let (s, _) = l.accept().await?;
+                                    println!("Accepted reverse connection!");
+                                    s
+                                }
+                            }
+                        },
+                        res = l.accept() => {
+                            let (s, _) = res?;
+                            println!("Accepted reverse connection!");
+                            s
+                        }
+                    }
+                } else {
+                    TcpStream::connect(&ip).await?
+                };
                 socket.set_nodelay(true)?;
 
                 let crypto = Crypto::new(&KEY_BYTES);
@@ -221,24 +257,27 @@ impl eframe::App for ViewerApp {
                                     let (tx, rx) = std::sync::mpsc::channel();
                                     self.conn_req_rx = Some(rx);
                                     
-                                    // Clone discovery to pass to task if needed, but DiscoveryClient is new-able
-                                    // We create a new client for request because `request_connection` is on `DiscoveryClient`
-                                    // and `self.discovery` is inside `self` which is borrowed.
-                                    // Actually `DiscoveryClient` has Arc internals, so cloning it is cheap if we derived Clone.
-                                    // But I didn't derive Clone. Let's just create a new one as it's stateless except for shared Arcs.
-                                    // Wait, `DiscoveryClient::new()` creates NEW Arcs. So it doesn't share state.
-                                    // But `request_connection` creates a NEW socket connection, so it doesn't need shared state!
-                                    // So `DiscoveryClient::new()` is fine.
-                                    
                                     tokio::spawn(async move {
+                                        // Start listener for reverse connection
+                                        let (listener, viewer_port) = match TcpListener::bind("0.0.0.0:0").await {
+                                            Ok(l) => {
+                                                if let Ok(addr) = l.local_addr() {
+                                                    (Some(l), Some(addr.port()))
+                                                } else {
+                                                    (None, None)
+                                                }
+                                            },
+                                            Err(_) => (None, None)
+                                        };
+
+                                        let viewer_ip = get_local_ip();
+
                                         let client = DiscoveryClient::new();
-                                        match client.request_connection(host_id).await {
+                                        match client.request_connection(host_id, viewer_ip, viewer_port).await {
                                             Ok((ip, port)) => {
-                                                let _ = tx.send((ip, port));
+                                                let _ = tx.send((ip, port, listener));
                                             }
                                             Err(e) => {
-                                                // Handle error (maybe send empty or error msg via another channel?)
-                                                // For now just print
                                                 eprintln!("Connection request failed: {}", e);
                                             }
                                         }
@@ -251,10 +290,10 @@ impl eframe::App for ViewerApp {
 
                 // Check for connection response
                 if let Some(rx) = &self.conn_req_rx {
-                    if let Ok((ip, port)) = rx.try_recv() {
+                    if let Ok((ip, port, listener)) = rx.try_recv() {
                         self.host_ip = format!("{}:{}", ip, port);
                         self.conn_req_rx = None; // Clear receiver
-                        self.connect(ctx.clone());
+                        self.connect(ctx.clone(), listener);
                     }
                 }
                  

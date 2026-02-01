@@ -53,11 +53,11 @@ Filename: "{sys}\sc.exe"; Parameters: "description SysRemoteHost ""Serviço de a
 Filename: "{sys}\sc.exe"; Parameters: "start SysRemoteHost"; Flags: runhidden; StatusMsg: "Iniciando serviço..."; Components: host
 
 ; Firewall Host
-Filename: "{cmd}"; Parameters: "/C """"{sys}\netsh.exe"""" advfirewall firewall delete rule name=""SysRemote Host"" >nul 2>nul & """"{sys}\netsh.exe"""" advfirewall firewall add rule name=""SysRemote Host"" dir=in action=allow program=""""{app}\host.exe"""" enable=yes"""; Flags: runhidden; Components: host
-Filename: "{cmd}"; Parameters: "/C """"{sys}\netsh.exe"""" advfirewall firewall delete rule name=""SysRemote Port"" >nul 2>nul & """"{sys}\netsh.exe"""" advfirewall firewall add rule name=""SysRemote Port"" dir=in action=allow protocol=TCP localport=5599"""; Flags: runhidden; Components: host
+Filename: "{cmd}"; Parameters: "/C """"{sys}\netsh.exe"""" advfirewall firewall delete rule name=""SysRemote Host"" >nul 2>nul & """"{sys}\netsh.exe"""" advfirewall firewall add rule name=""SysRemote Host"" dir=in action=allow program=""""{app}\host.exe"""" enable=yes profile=domain,private,public"""; Flags: runhidden; Components: host
+Filename: "{cmd}"; Parameters: "/C """"{sys}\netsh.exe"""" advfirewall firewall delete rule name=""SysRemote Port"" >nul 2>nul & """"{sys}\netsh.exe"""" advfirewall firewall add rule name=""SysRemote Port"" dir=in action=allow protocol=TCP localport=5599 profile=domain,private,public"""; Flags: runhidden; Components: host
 
 ; Firewall Viewer
-Filename: "{cmd}"; Parameters: "/C """"{sys}\netsh.exe"""" advfirewall firewall delete rule name=""SysRemote Viewer"" >nul 2>nul & """"{sys}\netsh.exe"""" advfirewall firewall add rule name=""SysRemote Viewer"" dir=in action=allow program=""""{app}\viewer.exe"""" enable=yes"""; Flags: runhidden; Components: viewer
+Filename: "{cmd}"; Parameters: "/C """"{sys}\netsh.exe"""" advfirewall firewall delete rule name=""SysRemote Viewer"" >nul 2>nul & """"{sys}\netsh.exe"""" advfirewall firewall add rule name=""SysRemote Viewer"" dir=in action=allow program=""""{app}\viewer.exe"""" enable=yes profile=domain,private,public"""; Flags: runhidden; Components: viewer
 
 [UninstallRun]
 Filename: "{cmd}"; Parameters: "/C """"{sys}\sc.exe"""" stop SysRemoteHost >nul 2>nul & exit /b 0"""; Flags: runhidden; RunOnceId: "sysremote_stop_service"

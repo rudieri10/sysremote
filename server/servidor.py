@@ -32,14 +32,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SysRemoteServer")
 
+# ============================================================
+# FIX 2: Suprimir erros de handshake causados por probes TCP
+# A GUI do host faz TcpStream::connect na porta 5600 para
+# diagnostico, envia 0 bytes e fecha. O filtro e aplicado nos
+# handlers do root logger para pegar mensagens de todos os
+# sub-loggers do websockets (websockets.server, etc).
+# ============================================================
+class HandshakeFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage().lower()
+        if "opening handshake failed" in msg or "did not receive a valid http request" in msg:
+            return False
+        return True
+
+_hf = HandshakeFilter()
+for _handler in logging.root.handlers:
+    _handler.addFilter(_hf)
+# ============================================================
+
 # Database Setup
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Hosts table
     c.execute('''CREATE TABLE IF NOT EXISTS hosts
                  (host_id TEXT PRIMARY KEY, hostname TEXT, ip TEXT, user TEXT, os TEXT, last_seen DATETIME, status TEXT)''')
-    # Sessions table
     c.execute('''CREATE TABLE IF NOT EXISTS sessions
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, viewer_id TEXT, host_id TEXT, start_time DATETIME, end_time DATETIME, duration INTEGER)''')
     conn.commit()
@@ -81,7 +98,7 @@ def run_flask():
     app.run(host=HOST, port=WEB_PORT, debug=False, use_reloader=False)
 
 # WebSocket Handler
-connected_hosts = {} # map host_id -> websocket
+connected_hosts = {}
 
 async def update_host_status(host_id, status, hostname=None, ip=None, user=None, os_info=None):
     try:
@@ -89,7 +106,6 @@ async def update_host_status(host_id, status, hostname=None, ip=None, user=None,
         c = conn.cursor()
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Check if exists
         c.execute("SELECT 1 FROM hosts WHERE host_id = ?", (host_id,))
         exists = c.fetchone()
         
@@ -140,27 +156,45 @@ async def handle_message(websocket, message):
             logger.info(f"Host registered: {host_id}")
             
         elif msg_type == "list_hosts":
+            # FIX 3: Incluir campo 'ip' na resposta
             conn = sqlite3.connect(DB_PATH)
             conn.row_factory = sqlite3.Row
-            rows = conn.execute("SELECT host_id, hostname, status FROM hosts WHERE status='online'").fetchall()
+            rows = conn.execute("SELECT host_id, hostname, status, ip FROM hosts WHERE status='online'").fetchall()
             conn.close()
             
-            hosts_list = [{"host_id": r["host_id"], "hostname": r["hostname"], "status": r["status"]} for r in rows]
+            hosts_list = [{"host_id": r["host_id"], "hostname": r["hostname"], "status": r["status"], "ip": r["ip"]} for r in rows]
             response = {"type": "host_list", "hosts": hosts_list}
             await websocket.send(json.dumps(response))
             
         elif msg_type == "connect_request":
             viewer_id = data.get("viewer_id")
             host_id = data.get("host_id")
+            viewer_ip = data.get("viewer_ip")
+            viewer_port = data.get("viewer_port")
             
-            # Check if host is online
             conn = sqlite3.connect(DB_PATH)
             row = conn.execute("SELECT ip, status FROM hosts WHERE host_id = ?", (host_id,)).fetchone()
             conn.close()
             
-            if row and row[0]: # ip exists
+            if row and row[0]:
                 host_ip = row[0]
-                # Assuming 5599 as default host port
+                
+                # --- CRITICAL: REVERSE CONNECT LOGIC ---
+                # Se o Viewer mandou IP/Porta, tenta avisar o Host para conectar de volta
+                if viewer_ip and viewer_port and host_id in connected_hosts:
+                    try:
+                        reverse_msg = {
+                            "type": "reverse_connect",
+                            "viewer_ip": viewer_ip,
+                            "viewer_port": viewer_port,
+                            "viewer_id": viewer_id
+                        }
+                        await connected_hosts[host_id].send(json.dumps(reverse_msg))
+                        logger.info(f"Sent Reverse Connect to {host_id} for viewer {viewer_ip}:{viewer_port}")
+                    except Exception as e:
+                        logger.error(f"Failed to send Reverse Connect to {host_id}: {e}")
+                # ---------------------------------------
+
                 response = {
                     "type": "connect_response", 
                     "success": True, 
@@ -173,19 +207,19 @@ async def handle_message(websocket, message):
                 
             await websocket.send(json.dumps(response))
             
+        # FIX 4: Heartbeat implementado corretamente
         elif msg_type == "heartbeat":
             host_id = data.get("host_id")
             if host_id:
-                # We update status but not full info
-                # Need to fetch IP from DB if not provided, or just update last_seen
-                # For simplicity, update_host_status handles partial updates if we structure it right,
-                # but here we just pass 'online' which updates last_seen.
-                # However, my update_host_status implementation expects IP if provided, or leaves it if not?
-                # Actually my impl overwrites IP if provided. If None, it sets IP to None?
-                # Wait, "UPDATE hosts SET ... ip = ?". If ip is None, it sets to NULL.
-                # I should fix update_host_status to only update provided fields.
-                pass 
-                # See fix below in ws_handler loop
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    c.execute("UPDATE hosts SET last_seen = ?, status = 'online' WHERE host_id = ?", (now, host_id))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    logger.error(f"Heartbeat DB error: {e}")
 
     except Exception as e:
         logger.error(f"Error handling message: {e}")
@@ -193,16 +227,18 @@ async def handle_message(websocket, message):
 async def ws_handler(websocket):
     current_host_id = None
     try:
+        logger.info("connection open")
         async for message in websocket:
-            # Basic heartbeat logic: any message updates last_seen for current_host_id
             if current_host_id:
-                 # Minimal update to keep alive
-                 conn = sqlite3.connect(DB_PATH)
-                 c = conn.cursor()
-                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                 c.execute("UPDATE hosts SET last_seen = ?, status = 'online' WHERE host_id = ?", (now, current_host_id))
-                 conn.commit()
-                 conn.close()
+                 try:
+                     conn = sqlite3.connect(DB_PATH)
+                     c = conn.cursor()
+                     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                     c.execute("UPDATE hosts SET last_seen = ?, status = 'online' WHERE host_id = ?", (now, current_host_id))
+                     conn.commit()
+                     conn.close()
+                 except Exception as e:
+                     logger.error(f"DB error in ws_handler loop: {e}")
 
             data = json.loads(message)
             if data.get("type") == "register_host":
@@ -215,12 +251,14 @@ async def ws_handler(websocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
+        # FIX 1: So marca offline se esta conexao ainda e a ativa
         if current_host_id:
-            logger.info(f"Host disconnected: {current_host_id}")
-            if current_host_id in connected_hosts:
+            if connected_hosts.get(current_host_id) is websocket:
+                logger.info(f"Host disconnected: {current_host_id}")
                 del connected_hosts[current_host_id]
-            # Mark offline immediately
-            await update_host_status(current_host_id, 'offline')
+                await update_host_status(current_host_id, 'offline')
+            else:
+                logger.info(f"Connection closed for {current_host_id} (replaced by newer connection, not marking offline)")
 
 async def host_cleaner():
     while True:
@@ -230,7 +268,6 @@ async def host_cleaner():
             threshold = datetime.datetime.now() - datetime.timedelta(seconds=HOST_TIMEOUT)
             threshold_str = threshold.strftime("%Y-%m-%d %H:%M:%S")
             
-            # Find hosts to mark offline
             c.execute("SELECT host_id FROM hosts WHERE status='online' AND last_seen < ?", (threshold_str,))
             offline_hosts = c.fetchall()
             
@@ -251,12 +288,10 @@ async def host_cleaner():
 async def main():
     init_db()
     
-    # Start Flask
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     
-    # Start WebSocket
     logger.info(f"Starting WebSocket Server on {HOST}:{WS_PORT}")
     async with websockets.serve(ws_handler, HOST, WS_PORT):
         await host_cleaner()

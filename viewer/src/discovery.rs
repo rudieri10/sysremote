@@ -92,7 +92,7 @@ impl DiscoveryClient {
         });
     }
 
-    pub async fn request_connection(&self, host_id: String) -> Result<(String, u16), String> {
+    pub async fn request_connection(&self, host_id: String, viewer_ip: Option<String>, viewer_port: Option<u16>) -> Result<(String, u16), String> {
         // We create a temporary one-off connection or use the main loop?
         // Using main loop requires channel communication which I didn't set up.
         // For simplicity, let's open a new short-lived connection or improve the architecture.
@@ -103,6 +103,8 @@ impl DiscoveryClient {
                 let req = DiscoveryMessage::ConnectRequest {
                     viewer_id: "Viewer".to_string(),
                     host_id,
+                    viewer_ip,
+                    viewer_port,
                 };
                 send_msg(&mut ws_stream, req).await.map_err(|e| e.to_string())?;
                 

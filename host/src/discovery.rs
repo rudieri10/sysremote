@@ -1,18 +1,24 @@
 use crate::logging::{log_error, log_info};
 use anyhow::Result;
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use local_ip_address::local_ip;
 use serde_json::to_string;
 use shared::{DiscoveryMessage, DISCOVERY_WS_URL};
 use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use url::Url;
 
-pub async fn start_discovery_service() {
-    // This function now just calls the infinite loop, used for spawning
-    maintain_discovery_connection().await;
+use crate::shmem_utils;
+
+pub async fn start_discovery_service(
+    pipe: Arc<tokio::sync::Mutex<NamedPipeServer>>,
+    shmem: Arc<Mutex<shmem_utils::Shmem>>,
+) {
+    maintain_discovery_connection(pipe, shmem).await;
 }
 
 pub async fn ensure_initial_registration() -> Result<()> {
@@ -52,7 +58,10 @@ pub async fn ensure_initial_registration() -> Result<()> {
     Ok(())
 }
 
-async fn maintain_discovery_connection() {
+async fn maintain_discovery_connection(
+    pipe: Arc<tokio::sync::Mutex<NamedPipeServer>>,
+    shmem: Arc<Mutex<shmem_utils::Shmem>>,
+) {
     let hostname = whoami::fallible::hostname().unwrap_or_else(|_| "Unknown".to_string());
     let user = whoami::fallible::username().unwrap_or_else(|_| "Unknown".to_string());
     let os = format!("{} {}", whoami::platform(), whoami::distro());
@@ -61,9 +70,11 @@ async fn maintain_discovery_connection() {
     loop {
         log_info(&format!("Connecting to discovery server (maintenance) at {}...", DISCOVERY_WS_URL));
         match connect_to_server().await {
-            Ok(mut ws_stream) => {
+            Ok(ws_stream) => {
                 log_info("Connected to discovery server.");
                 
+                let (mut write, mut read) = ws_stream.split();
+
                 // 1. Register
                 let ip = select_local_ip();
                 
@@ -75,22 +86,73 @@ async fn maintain_discovery_connection() {
                     os: os.clone(),
                 };
 
-                if let Err(e) = send_msg(&mut ws_stream, register_msg).await {
+                // Manually serialize and send because split() gives us a SplitSink that takes tungstenite::Message
+                let msg_str = serde_json::to_string(&register_msg).unwrap();
+                if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_str)).await {
                     log_error(&format!("Failed to register: {}", e));
                     continue; 
                 }
                 log_info(&format!("Registered as {}", host_id));
 
-                // 2. Heartbeat Loop
+                // 2. Heartbeat & Read Loop
+                let mut interval = tokio::time::interval(Duration::from_secs(15));
+
                 loop {
-                    tokio::time::sleep(Duration::from_secs(15)).await;
-                    let heartbeat = DiscoveryMessage::Heartbeat {
-                        host_id: host_id.clone(),
-                    };
-                    
-                    if let Err(e) = send_msg(&mut ws_stream, heartbeat).await {
-                        log_info(&format!("Heartbeat failed (disconnected): {}. Reconnecting...", e));
-                        break; 
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let heartbeat = DiscoveryMessage::Heartbeat {
+                                host_id: host_id.clone(),
+                            };
+                            let msg_str = serde_json::to_string(&heartbeat).unwrap();
+                            if let Err(e) = write.send(tokio_tungstenite::tungstenite::Message::Text(msg_str)).await {
+                                log_info(&format!("Heartbeat failed (disconnected): {}. Reconnecting...", e));
+                                break; 
+                            }
+                        }
+                        msg = read.next() => {
+                            match msg {
+                                Some(Ok(m)) => {
+                                    if let Ok(text) = m.to_text() {
+                                        if let Ok(parsed) = serde_json::from_str::<DiscoveryMessage>(text) {
+                                            match parsed {
+                                                DiscoveryMessage::ReverseConnect { viewer_ip, viewer_port, viewer_id } => {
+                                                    log_info(&format!("Received Reverse Connect request from viewer {} at {}:{}", viewer_id, viewer_ip, viewer_port));
+                                                    let pipe = pipe.clone();
+                                                    let shmem = shmem.clone();
+                                                    let viewer_addr = format!("{}:{}", viewer_ip, viewer_port);
+                                                    
+                                                    tokio::spawn(async move {
+                                                        log_info(&format!("Initiating reverse connection to {}", viewer_addr));
+                                                        match TcpStream::connect(&viewer_addr).await {
+                                                            Ok(socket) => {
+                                                                log_info(&format!("Reverse connection established to {}", viewer_addr));
+                                                                if let Err(e) = crate::handle_client(socket, pipe, shmem).await {
+                                                                    log_error(&format!("Error in reverse connection session: {}", e));
+                                                                } else {
+                                                                    log_info("Reverse connection session ended.");
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                log_error(&format!("Failed to connect to viewer {}: {}", viewer_addr, e));
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    log_error(&format!("WebSocket read error: {}", e));
+                                    break;
+                                }
+                                None => {
+                                    log_info("WebSocket connection closed.");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }
