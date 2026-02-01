@@ -5,6 +5,7 @@ use crate::logging::log_path;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
+use shared::{DISCOVERY_HOST, DISCOVERY_PORT};
 
 pub fn run_gui() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
@@ -86,7 +87,7 @@ impl HostApp {
             // Check 2: Can we reach Discovery Server?
             // Assuming Discovery is at 34.135.23.167:3000 (from shared lib or config)
             // But let's use the actual discovery logic if possible, or just a TCP connect
-            let discovery = std::net::TcpStream::connect("34.135.23.167:3000").is_ok();
+            let discovery = std::net::TcpStream::connect(format!("{}:{}", DISCOVERY_HOST, DISCOVERY_PORT)).is_ok();
             
             // Check 3: Is Local Port Open? (Service running)
             let local = std::net::TcpStream::connect("127.0.0.1:5599").is_ok();
@@ -156,7 +157,7 @@ impl eframe::App for HostApp {
                     if ui.button(egui::RichText::new("🔍 Run Connection Diagnostics").size(16.0)).clicked() {
                         // Perform checks
                         let internet = std::net::TcpStream::connect_timeout(&"8.8.8.8:53".parse().unwrap(), Duration::from_secs(2)).is_ok();
-                        let discovery = std::net::TcpStream::connect_timeout(&"34.135.23.167:3000".parse().unwrap(), Duration::from_secs(2)).is_ok();
+                        let discovery = std::net::TcpStream::connect_timeout(&format!("{}:{}", DISCOVERY_HOST, DISCOVERY_PORT).parse().unwrap(), Duration::from_secs(2)).is_ok();
                         let local = std::net::TcpStream::connect_timeout(&"127.0.0.1:5599".parse().unwrap(), Duration::from_secs(1)).is_ok();
                         
                         let mut status = String::new();

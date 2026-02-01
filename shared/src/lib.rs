@@ -8,6 +8,11 @@ use thiserror::Error;
 
 pub const DEFAULT_PORT: u16 = 5599;
 
+pub const DISCOVERY_HOST: &str = "192.168.1.238";
+pub const DISCOVERY_PORT: u16 = 5600;
+pub const DISCOVERY_WS_URL: &str = "ws://192.168.1.238:5600";
+
+
 // --- Discovery Protocol Structs ---
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

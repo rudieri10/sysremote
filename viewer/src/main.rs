@@ -29,7 +29,7 @@ struct ViewerApp {
     texture: Option<TextureHandle>,
     latest_image: Arc<Mutex<Option<ColorImage>>>,
     tx_input: Option<tokio::sync::mpsc::Sender<InputEvent>>,
-    is_connected: bool,
+    connection_state: Arc<Mutex<String>>,
     held_buttons: std::collections::HashSet<MouseButton>,
     discovery: DiscoveryClient,
     conn_req_rx: Option<std::sync::mpsc::Receiver<(String, u16)>>,
@@ -46,7 +46,7 @@ impl ViewerApp {
             texture: None,
             latest_image: Arc::new(Mutex::new(None)),
             tx_input: None,
-            is_connected: false,
+            connection_state: Arc::new(Mutex::new("disconnected".to_string())),
             held_buttons: std::collections::HashSet::new(),
             discovery,
             conn_req_rx: None,
@@ -56,6 +56,7 @@ impl ViewerApp {
     fn connect(&mut self, ctx: egui::Context) {
         let ip = self.host_ip.clone();
         let image_store = self.latest_image.clone();
+        let conn_state = self.connection_state.clone();
 
         // We create a channel, but to support reconnects we should really keep the sender in the App struct
         // and just create a new receiver for each connection if possible?
@@ -65,7 +66,7 @@ impl ViewerApp {
         self.tx_input = Some(tx_input);
 
         self.status = "Connecting...".to_owned();
-        self.is_connected = true;
+        *conn_state.lock().unwrap() = "connecting".to_string();
 
         tokio::spawn(async move {
             println!("Connecting to {}...", ip);
@@ -96,6 +97,8 @@ impl ViewerApp {
                 }
 
                 println!("Connected!");
+                *conn_state.lock().unwrap() = "connected".to_string();
+
                 let (mut reader, mut writer) = socket.into_split();
                 let crypto_read = Arc::new(crypto);
                 let crypto_write = crypto_read.clone();
@@ -150,19 +153,42 @@ impl ViewerApp {
 
             if let Err(e) = result {
                 eprintln!("Connection error: {}", e);
+                *conn_state.lock().unwrap() = format!("error: {}", e);
+            } else {
+                *conn_state.lock().unwrap() = "disconnected".to_string();
             }
-            // On exit, set status to disconnected?
-            // We can't easily update `self.is_connected` from here because `self` is not available.
-            // But the UI will show "Connecting..." or stale image.
-            // We should probably send a message back to UI thread or use Arc<Mutex<State>>.
+            // Pequeno delay para o usuário ver a mensagem de erro antes de voltar
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            *conn_state.lock().unwrap() = "disconnected".to_string();
         });
     }
 }
 
 impl eframe::App for ViewerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let current_state = self.connection_state.lock().unwrap().clone();
+        let is_connected = current_state == "connecting" || current_state == "connected";
+
+        if current_state == "disconnected" || current_state.starts_with("error:") {
+            // Limpar texture e input sender quando desconectar
+            if self.texture.is_some() || self.tx_input.is_some() {
+                self.texture = None;
+                self.tx_input = None;
+                *self.latest_image.lock().unwrap() = None;
+                self.held_buttons.clear();
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            if !self.is_connected {
+            if !is_connected {
+                if current_state.starts_with("error:") {
+                    ui.colored_label(egui::Color32::RED, &current_state);
+                    ui.add_space(5.0);
+                } else if current_state == "connecting" {
+                    ui.colored_label(egui::Color32::YELLOW, "Connecting...");
+                    ui.add_space(5.0);
+                }
+
                 ui.heading("Available Hosts");
                 ui.label(format!("Status: {}", self.discovery.get_status()));
                 
@@ -351,6 +377,7 @@ impl eframe::App for ViewerApp {
                 }
             }
         });
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
 

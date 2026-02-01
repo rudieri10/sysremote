@@ -1,13 +1,11 @@
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{from_str, to_string};
-use shared::{DiscoveryMessage, HostInfo};
+use shared::{DiscoveryMessage, HostInfo, DISCOVERY_WS_URL};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use url::Url;
-
-const DISCOVERY_URL: &str = "ws://192.168.1.238:5600";
 
 pub struct DiscoveryClient {
     hosts: Arc<Mutex<Vec<HostInfo>>>,
@@ -37,7 +35,7 @@ impl DiscoveryClient {
         tokio::spawn(async move {
             loop {
                 *status_clone.lock().unwrap() = "Connecting...".to_string();
-                match connect_async(Url::parse(DISCOVERY_URL).unwrap()).await {
+                match connect_async(Url::parse(DISCOVERY_WS_URL).unwrap()).await {
                     Ok((mut ws_stream, _)) => {
                         *status_clone.lock().unwrap() = "Connected".to_string();
                         
@@ -100,7 +98,7 @@ impl DiscoveryClient {
         // For simplicity, let's open a new short-lived connection or improve the architecture.
         // Given the constraints, I will open a new connection for the request.
         
-        match connect_async(Url::parse(DISCOVERY_URL).unwrap()).await {
+        match connect_async(Url::parse(DISCOVERY_WS_URL).unwrap()).await {
             Ok((mut ws_stream, _)) => {
                 let req = DiscoveryMessage::ConnectRequest {
                     viewer_id: "Viewer".to_string(),

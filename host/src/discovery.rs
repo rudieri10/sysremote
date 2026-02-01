@@ -3,14 +3,12 @@ use anyhow::Result;
 use futures_util::SinkExt;
 use local_ip_address::local_ip;
 use serde_json::to_string;
-use shared::DiscoveryMessage;
+use shared::{DiscoveryMessage, DISCOVERY_WS_URL};
 use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use url::Url;
-
-const DISCOVERY_URL: &str = "ws://192.168.1.238:5600";
 
 pub async fn start_discovery_service() {
     // This function now just calls the infinite loop, used for spawning
@@ -24,7 +22,7 @@ pub async fn ensure_initial_registration() -> Result<()> {
     let host_id = format!("HOST_{}", hostname);
     
     // Try to connect once
-    log_info(&format!("Initial connection attempt to discovery server at {}...", DISCOVERY_URL));
+    log_info(&format!("Initial connection attempt to discovery server at {}...", DISCOVERY_WS_URL));
     
     let mut ws_stream = loop {
         match connect_to_server().await {
@@ -61,7 +59,7 @@ async fn maintain_discovery_connection() {
     let host_id = format!("HOST_{}", hostname);
 
     loop {
-        log_info(&format!("Connecting to discovery server (maintenance) at {}...", DISCOVERY_URL));
+        log_info(&format!("Connecting to discovery server (maintenance) at {}...", DISCOVERY_WS_URL));
         match connect_to_server().await {
             Ok(mut ws_stream) => {
                 log_info("Connected to discovery server.");
@@ -105,13 +103,13 @@ async fn maintain_discovery_connection() {
 }
 
 async fn connect_to_server() -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-    let url = Url::parse(DISCOVERY_URL)?;
+    let url = Url::parse(DISCOVERY_WS_URL)?;
     let (ws_stream, _) = connect_async(url).await?;
     Ok(ws_stream)
 }
 
 fn select_local_ip() -> String {
-    if let Ok(url) = Url::parse(DISCOVERY_URL) {
+    if let Ok(url) = Url::parse(DISCOVERY_WS_URL) {
         if let Some(host) = url.host_str() {
             let port = url.port_or_known_default().unwrap_or(5600);
             let target = format!("{}:{}", host, port);
