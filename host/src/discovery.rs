@@ -4,6 +4,7 @@ use futures_util::SinkExt;
 use local_ip_address::local_ip;
 use serde_json::to_string;
 use shared::DiscoveryMessage;
+use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -38,7 +39,7 @@ pub async fn ensure_initial_registration() -> Result<()> {
     log_info("Connected to discovery server. Registering...");
 
     // Register
-    let ip = local_ip().map(|ip| ip.to_string()).unwrap_or_else(|_| "0.0.0.0".to_string());
+    let ip = select_local_ip();
     let register_msg = DiscoveryMessage::RegisterHost {
         host_id: host_id.clone(),
         hostname: hostname.clone(),
@@ -66,7 +67,7 @@ async fn maintain_discovery_connection() {
                 log_info("Connected to discovery server.");
                 
                 // 1. Register
-                let ip = local_ip().map(|ip| ip.to_string()).unwrap_or_else(|_| "0.0.0.0".to_string());
+                let ip = select_local_ip();
                 
                 let register_msg = DiscoveryMessage::RegisterHost {
                     host_id: host_id.clone(),
@@ -107,6 +108,43 @@ async fn connect_to_server() -> Result<WebSocketStream<MaybeTlsStream<TcpStream>
     let url = Url::parse(DISCOVERY_URL)?;
     let (ws_stream, _) = connect_async(url).await?;
     Ok(ws_stream)
+}
+
+fn select_local_ip() -> String {
+    if let Ok(url) = Url::parse(DISCOVERY_URL) {
+        if let Some(host) = url.host_str() {
+            let port = url.port_or_known_default().unwrap_or(5600);
+            let target = format!("{}:{}", host, port);
+            if let Ok(mut addrs) = target.to_socket_addrs() {
+                while let Some(addr) = addrs.next() {
+                    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+                        if sock.connect(addr).is_ok() {
+                            if let Ok(local_addr) = sock.local_addr() {
+                                let ip = local_addr.ip();
+                                if is_valid_ip(ip) {
+                                    log_info(&format!("Selected local IP via route: {}", ip));
+                                    return ip.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let ip = local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|_| "0.0.0.0".to_string());
+    log_info(&format!("Selected local IP via fallback: {}", ip));
+    ip
+}
+
+fn is_valid_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+    }
 }
 
 async fn send_msg(

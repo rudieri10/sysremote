@@ -33,10 +33,14 @@ pub fn init_log() {
 
 fn log_write(level: &str, msg: &str) {
     init_log();
+    let pid = std::process::id();
+    let tid = format!("{:?}", std::thread::current().id());
     let line = format!(
-        "[{}] {} {}\r\n",
+        "[{}] {} pid={} tid={} {}\r\n",
         level,
         chrono_like_timestamp(),
+        pid,
+        tid,
         msg.replace('\n', " ")
     );
     

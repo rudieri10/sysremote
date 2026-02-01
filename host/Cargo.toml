@@ -17,7 +17,7 @@ anyhow = "1.0"
 futures-util = "0.3"
 bincode = "1.3"
 serde = { version = "1.0", features = ["derive"] }
-winapi = { version = "0.3", features = ["windef", "winuser", "wingdi", "winbase", "processthreadsapi", "securitybaseapi", "handleapi", "objbase", "wtsapi32", "userenv", "wincon", "consoleapi", "winsvc", "errhandlingapi", "tlhelp32"] }
+winapi = { version = "0.3", features = ["windef", "winuser", "wingdi", "winbase", "processthreadsapi", "securitybaseapi", "handleapi", "objbase", "wtsapi32", "userenv", "wincon", "consoleapi", "winsvc", "errhandlingapi", "tlhelp32", "memoryapi", "sddl"] }
 xcap = "0.8.1"
 openh264 = "0.9.3"
 windows-service = "0.8.0"

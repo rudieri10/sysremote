@@ -1,5 +1,5 @@
 use eframe::egui;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 use crate::logging::log_path;
 use std::io::Read;

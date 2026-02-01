@@ -123,6 +123,29 @@ pub enum MouseButton {
     Other(u8),
 }
 
+// --- IPC Protocol Structs ---
+
+pub const IPC_PIPE_NAME: &str = r"\\.\pipe\SysRemotePipe";
+pub const IPC_SHMEM_NAME: &str = "Global\\SysRemoteShm";
+// Buffer size: Enough for 4K RGBA (3840*2160*4 = ~33MB). 
+// Let's allocate 64MB to be safe and allow double buffering if needed.
+pub const IPC_SHMEM_SIZE: usize = 64 * 1024 * 1024; 
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum IpcMessage {
+    CaptureRequest,
+    FrameReady {
+        size: usize,
+        width: u32,
+        height: u32,
+        keyframe: bool,
+    },
+    Input(InputEvent),
+    Pong,
+}
+
+// --- End IPC Protocol Structs ---
+
 #[derive(Error, Debug)]
 pub enum CryptoError {
     #[error("Encryption failed")]

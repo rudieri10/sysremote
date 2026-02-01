@@ -3,8 +3,7 @@
 use anyhow::Result;
 use openh264::encoder::Encoder;
 use openh264::formats::YUVBuffer;
-use screenshots::Screen;
-use shared::{Crypto, InputEvent, MouseButton, NetworkMessage, RemoteKey, DEFAULT_PORT};
+use shared::{Crypto, NetworkMessage, DEFAULT_PORT};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, OnceLock,
@@ -13,22 +12,26 @@ use std::sync::{
 mod discovery;
 mod logging;
 mod gui;
+mod agent;
+mod shmem_utils;
 
 use logging::{init_log, log_error, log_info, log_path};
 use std::time::{Duration, Instant};
 use std::io::Read;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::net::windows::named_pipe::{ServerOptions, NamedPipeServer};
+use shared::{IpcMessage, IPC_PIPE_NAME, IPC_SHMEM_NAME, IPC_SHMEM_SIZE};
+
 use windows_service::{
     define_windows_service,
     service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
-        ServiceType, SessionChangeReason, SessionNotification,
+        ServiceType, SessionChangeReason,
     },
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
 };
-use xcap::Monitor;
 
 define_windows_service!(ffi_service_main, my_service_main);
 
@@ -68,6 +71,19 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<()> {
     let status_handle = service_control_handler::register("SysRemoteHost", event_handler)?;
 
     init_log();
+    let exe_path = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let username = std::env::var("USERNAME").unwrap_or_else(|_| "unknown".to_string());
+    let domain = std::env::var("USERDOMAIN").unwrap_or_else(|_| "unknown".to_string());
+    log_info(&format!(
+        "Service init: exe={} pid={} user={}\\{} log={}",
+        exe_path,
+        std::process::id(),
+        domain,
+        username,
+        log_path().display()
+    ));
     let next_status = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Running,
@@ -95,6 +111,13 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<()> {
     // Start Discovery Service (Maintenance in background)
     rt.spawn(async {
         discovery::start_discovery_service().await;
+    });
+
+    // Start Host Server
+    rt.spawn(async {
+        if let Err(e) = run_server().await {
+            log_error(&format!("Host server error: {}", e));
+        }
     });
 
     log_info("Service started. Launching agent in active user session...");
@@ -202,8 +225,6 @@ fn is_elevated() -> bool {
         result != 0 && elevation.TokenIsElevated != 0
     }
 }
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
-
 const PSK: &str = "mysecretpassword"; // Hardcoded for simplicity as requested "senha fixa"
 const KEY_BYTES: [u8; 32] = [0x42; 32]; // Fixed key for encryption for now (should derive from PSK in real app)
 
@@ -275,8 +296,11 @@ fn spawn_agent_in_active_session() -> Result<u32> {
         if session_id == 0xFFFFFFFF {
             anyhow::bail!("No active console session found (WTSGetActiveConsoleSessionId returned -1)");
         }
-        
-        log_info(&format!("Attempting to spawn agent in Session {}", session_id));
+        log_info(&format!(
+            "Attempting to spawn agent in Session {} (local_system={})",
+            session_id,
+            is_running_as_local_system()
+        ));
 
         let mut user_token: winapi::um::winnt::HANDLE = std::ptr::null_mut();
         let mut retry_count = 0;
@@ -327,6 +351,10 @@ fn spawn_agent_in_active_session() -> Result<u32> {
 
         let mut env: winapi::shared::minwindef::LPVOID = std::ptr::null_mut();
         let env_ok = winapi::um::userenv::CreateEnvironmentBlock(&mut env, primary_token, 0);
+        if env_ok == 0 {
+            let err = winapi::um::errhandlingapi::GetLastError();
+            log_error(&format!("CreateEnvironmentBlock failed (err={})", err));
+        }
 
         let exe = std::env::current_exe()?;
         let exe_w: Vec<u16> = OsStr::new(exe.as_os_str())
@@ -335,6 +363,7 @@ fn spawn_agent_in_active_session() -> Result<u32> {
             .collect();
 
         let cmd = format!("\"{}\" --agent", exe.display());
+        log_info(&format!("Agent command line: {}", cmd));
         let mut cmd_w: Vec<u16> = OsStr::new(&cmd)
             .encode_wide()
             .chain(std::iter::once(0))
@@ -410,6 +439,7 @@ fn spawn_agent_in_active_session() -> Result<u32> {
 
         winapi::um::handleapi::CloseHandle(pi.hThread);
         winapi::um::handleapi::CloseHandle(pi.hProcess);
+        log_info(&format!("Agent process created (pid={})", pi.dwProcessId));
         Ok(pi.dwProcessId)
     }
 }
@@ -800,7 +830,18 @@ fn rgba_to_yuv420(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
 }
 
 fn main() -> Result<()> {
+    init_log();
     let args: Vec<String> = std::env::args().collect();
+    let exe_path = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    log_info(&format!(
+        "Host starting: exe={} pid={} args={:?} log={}",
+        exe_path,
+        std::process::id(),
+        args,
+        log_path().display()
+    ));
     if args.iter().any(|a| a == "--logs") {
         let _ = tail_logs_blocking();
         return Ok(());
@@ -808,7 +849,7 @@ fn main() -> Result<()> {
     if args.iter().any(|a| a == "--agent") {
         init_log();
         let rt = tokio::runtime::Runtime::new()?;
-        return rt.block_on(run_server());
+        return rt.block_on(agent::run_agent());
     }
 
     // Tenta rodar como serviço
@@ -889,6 +930,9 @@ async fn run_server() -> Result<()> {
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => {
             log_info(&format!("Host successfully bound to {}", addr));
+            if let Ok(actual) = l.local_addr() {
+                log_info(&format!("Host listening on {}", actual));
+            }
             l
         }
         Err(e) => {
@@ -896,6 +940,51 @@ async fn run_server() -> Result<()> {
             return Err(e.into());
         }
     };
+
+    // --- IPC SETUP ---
+    log_info("Initializing IPC (Shared Memory & Pipe)...");
+    log_info(&format!(
+        "IPC names: pipe={} shmem={} shmem_size={}",
+        IPC_PIPE_NAME, IPC_SHMEM_NAME, IPC_SHMEM_SIZE
+    ));
+    
+    // Create Shared Memory
+    // We try to open or create. Service creates.
+    let shmem = match shmem_utils::Shmem::create(IPC_SHMEM_NAME, IPC_SHMEM_SIZE) {
+        Ok(m) => m,
+        Err(e) => {
+            log_error(&format!("Failed to create Shared Memory: {}", e));
+            return Err(e.into());
+        }
+    };
+    let shmem = Arc::new(Mutex::new(shmem));
+
+    // Create Named Pipe Server
+    let mut pipe_server = match ServerOptions::new().create(IPC_PIPE_NAME) {
+        Ok(p) => p,
+        Err(e) => {
+            log_error(&format!("Failed to create IPC pipe {}: {}", IPC_PIPE_NAME, e));
+            return Err(e.into());
+        }
+    };
+    
+    log_info("Waiting for Agent to connect on IPC pipe...");
+    // Wait for agent
+    match tokio::time::timeout(Duration::from_secs(30), pipe_server.connect()).await {
+        Ok(res) => {
+            if let Err(e) = res {
+                log_error(&format!("Agent failed to connect to pipe: {}", e));
+            } else {
+                log_info("Agent connected to IPC!");
+            }
+        }
+        Err(_) => {
+            log_error("Timeout waiting for Agent connection.");
+        }
+    }
+    
+    let pipe = Arc::new(tokio::sync::Mutex::new(pipe_server));
+
     log_info(&format!("Host listening loop started on {}", addr));
 
     loop {
@@ -903,9 +992,12 @@ async fn run_server() -> Result<()> {
             Ok((socket, remote_addr)) => {
                 log_info(&format!("ACCEPTED connection from {}", remote_addr));
                 
+                let pipe_clone = pipe.clone();
+                let shmem_clone = shmem.clone();
+
                 tokio::spawn(async move {
                     log_info(&format!("Spawning handler for {}", remote_addr));
-                    if let Err(e) = handle_client(socket).await {
+                    if let Err(e) = handle_client(socket, pipe_clone, shmem_clone).await {
                         log_error(&format!("Error handling client {}: {}", remote_addr, e));
                     } else {
                         log_info(&format!("Client {} disconnected gracefully", remote_addr));
@@ -919,21 +1011,30 @@ async fn run_server() -> Result<()> {
     }
 }
 
-async fn handle_client(mut socket: TcpStream) -> Result<()> {
-    let peer_addr = socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+async fn handle_client(
+    mut socket: TcpStream,
+    pipe: Arc<tokio::sync::Mutex<NamedPipeServer>>,
+    shmem: Arc<Mutex<shmem_utils::Shmem>>,
+) -> Result<()> {
+    let peer_addr = socket
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     log_info(&format!("[{}] Starting handshake...", peer_addr));
 
     let crypto = Crypto::new(&KEY_BYTES);
 
     // 1. Handshake
-    // Read size (4 bytes) -> Read Encrypted Data -> Decrypt -> Deserialize
     log_info(&format!("[{}] Waiting for handshake message...", peer_addr));
     let handshake_msg = match read_message(&mut socket, &crypto).await {
         Ok(msg) => msg,
         Err(e) => {
             let e_str = e.to_string().to_lowercase();
             if e_str.contains("early eof") || e_str.contains("unexpected end of file") {
-                log_info(&format!("[{}] Client disconnected during handshake (Connection Probe/Check).", peer_addr));
+                log_info(&format!(
+                    "[{}] Client disconnected during handshake (Connection Probe/Check).",
+                    peer_addr
+                ));
                 return Ok(());
             } else {
                 log_error(&format!("[{}] Handshake read failed: {}", peer_addr, e));
@@ -943,7 +1044,10 @@ async fn handle_client(mut socket: TcpStream) -> Result<()> {
     };
 
     if let NetworkMessage::Handshake { psk } = handshake_msg {
-        log_info(&format!("[{}] Received handshake PSK: {} (expected: {})", peer_addr, psk, PSK));
+        log_info(&format!(
+            "[{}] Received handshake PSK: {} (expected: {})",
+            peer_addr, psk, PSK
+        ));
         if psk != PSK {
             log_error(&format!("[{}] Invalid PSK received", peer_addr));
             let response = NetworkMessage::HandshakeAck { success: false };
@@ -951,11 +1055,17 @@ async fn handle_client(mut socket: TcpStream) -> Result<()> {
             return Ok(());
         }
     } else {
-        log_error(&format!("[{}] Unexpected message during handshake: {:?}", peer_addr, handshake_msg));
+        log_error(&format!(
+            "[{}] Unexpected message during handshake: {:?}",
+            peer_addr, handshake_msg
+        ));
         return Ok(());
     }
 
-    log_info(&format!("[{}] Handshake successful. Sending ACK...", peer_addr));
+    log_info(&format!(
+        "[{}] Handshake successful. Sending ACK...",
+        peer_addr
+    ));
     let response = NetworkMessage::HandshakeAck { success: true };
     send_message(&mut socket, &crypto, &response).await?;
     log_info(&format!("[{}] ACK sent. Splitting socket...", peer_addr));
@@ -964,275 +1074,155 @@ async fn handle_client(mut socket: TcpStream) -> Result<()> {
     let crypto_read = Arc::new(crypto);
     let crypto_write = crypto_read.clone();
 
-    // We need channels for proper async/blocking separation
+    // Channels
     let (tx_frame, mut rx_frame) = tokio::sync::mpsc::channel::<(Vec<u8>, bool)>(5);
 
-    // Capture Task (Heavy CPU)
-    std::thread::spawn(move || {
-        // Inicializa COM para DXGI/WMI
-        unsafe {
-            let _ = winapi::um::objbase::CoInitialize(std::ptr::null_mut());
+    // Capture Requester Task (Service -> Agent -> Service)
+    let pipe_clone = pipe.clone();
+    let shmem_clone = shmem.clone();
+
+    tokio::spawn(async move {
+        let mut encoder: Option<Encoder> = None;
+        let mut frame_count = 0;
+        let mut width = 1920;
+        let mut height = 1080;
+
+        // Initialize Encoder
+        match Encoder::new() {
+            Ok(enc) => encoder = Some(enc),
+            Err(e) => log_error(&format!("Failed to create encoder: {}", e)),
         }
 
-        log_info("Using RustDesk-like capture (xcap/DXGI) with OpenH264");
-        log_info(&format!("Running as Admin: {}", is_elevated()));
-
-        let mut monitor: Option<Monitor> = None;
-        let mut screen: Option<Screen> = None;
-        let mut encoder: Option<Encoder> = None;
-        let mut width = 0;
-        let mut height = 0;
-        let mut frame_count = 0;
-        let mut use_fallback = false;
-
-        // Retry logic counters
-        let mut dxgi_error_count = 0;
-        const MAX_DXGI_ERRORS: u32 = 10; // More aggressive retries before fallback
-        let mut last_access_denied_log: Option<Instant> = None;
-        let mut last_resolution_change_log: Option<Instant> = None;
-
         loop {
-            // Monitor Discovery/Recovery
-            // Try DXGI first if not in fallback mode
-            if !use_fallback && monitor.is_none() {
-                match Monitor::all() {
-                    Ok(monitors) => {
-                        // Simple multi-monitor support: Pick first valid one
-                        // In future: Iterate and match requested monitor ID
-                        if let Some(m) = monitors.into_iter().next() {
-                            log_info(&format!(
-                                "Monitor initialized (DXGI): {}",
-                                m.name().unwrap_or_default()
-                            ));
-                            width = m.width().unwrap_or(1920) as usize;
-                            height = m.height().unwrap_or(1080) as usize;
-                            monitor = Some(m);
+            let start = Instant::now();
 
-                            // Init Encoder if needed or resolution changed
-                            if encoder.is_none() {
-                                // TODO: Add HW encoding support here (via hwcodec or similar)
-                                // For now using OpenH264 (Software)
-                                match Encoder::new() {
-                                    Ok(enc) => encoder = Some(enc),
-                                    Err(e) => eprintln!("Failed to create encoder: {}", e),
-                                }
-                            }
-                        } else {
-                            log_error("No monitors found (xcap). Retrying...");
-                            // Fall through to dummy frame
-                        }
-                    }
-                    Err(e) => {
-                        log_error(&format!("Failed to enumerate monitors (xcap): {}", e));
-                        dxgi_error_count += 1;
-                        if dxgi_error_count > MAX_DXGI_ERRORS {
-                            log_info(&format!("Too many xcap errors ({}). Switching to GDI fallback (screenshots crate).", dxgi_error_count));
-                            use_fallback = true;
-                        }
-                        // Fall through to dummy frame
-                    }
-                }
-            }
+            // 1. Send Capture Request
+            let req = IpcMessage::CaptureRequest;
+            let req_bytes = serde_json::to_vec(&req).unwrap();
 
-            // Fallback Discovery (GDI)
-            if use_fallback && screen.is_none() {
-                log_info("gdi: true - Running in Fallback Mode (Low Quality/FPS)");
-                match Screen::all() {
-                    Ok(screens) => {
-                        if let Some(s) = screens.into_iter().next() {
-                            log_info(&format!(
-                                "Fallback Screen initialized (GDI): {:?}",
-                                s.display_info.id
-                            ));
-                            if width == 0 || height == 0 {
-                                width = s.display_info.width as usize;
-                                height = s.display_info.height as usize;
-                            }
-                            screen = Some(s);
-
-                            if encoder.is_none() {
-                                match Encoder::new() {
-                                    Ok(enc) => encoder = Some(enc),
-                                    Err(e) => eprintln!("Failed to create encoder: {}", e),
-                                }
-                            }
-                        } else {
-                            log_error("No screens found (fallback). Retrying...");
-                            // Fall through to dummy frame
-                        }
-                    }
-                    Err(e) => {
-                        log_error(&format!("Failed to enumerate screens (fallback): {}", e));
-                        // Fall through to dummy frame
-                    }
+            // Scope for Write Request
+            let write_result = {
+                let mut p = pipe_clone.lock().await;
+                async {
+                    p.write_u32(req_bytes.len() as u32).await?;
+                    p.write_all(&req_bytes).await?;
+                    Ok::<(), std::io::Error>(())
                 }
-            }
-
-            // CAPTURE
-            let capture_start = Instant::now();
-            let capture_result: anyhow::Result<(u32, u32, Vec<u8>)> = if use_fallback {
-                if let Some(ref s) = screen {
-                    s.capture()
-                        .map(|img| (img.width(), img.height(), img.into_raw()))
-                        .map_err(|e| anyhow::anyhow!(e))
-                } else {
-                    Err(anyhow::anyhow!("No screen"))
-                }
-            } else {
-                if let Some(ref m) = monitor {
-                    m.capture_image()
-                        .map(|img| (img.width(), img.height(), img.into_raw()))
-                        .map_err(|e| anyhow::anyhow!(e))
-                } else {
-                    Err(anyhow::anyhow!("No monitor"))
-                }
+                .await
             };
 
-            let (img_w, img_h, pixels) = match capture_result {
-                Ok(res) => res,
+            if let Err(e) = write_result {
+                log_error(&format!("IPC Write Error: {}", e));
+                break;
+            }
+
+            // Scope for Read Response
+            let frame_info = {
+                let mut p = pipe_clone.lock().await;
+                async {
+                    let len = p.read_u32().await?;
+                    let mut buf = vec![0u8; len as usize];
+                    p.read_exact(&mut buf).await?;
+                    Ok::<Vec<u8>, std::io::Error>(buf)
+                }
+                .await
+            };
+
+            match frame_info {
+                Ok(buf) => match serde_json::from_slice::<IpcMessage>(&buf) {
+                    Ok(msg) => {
+                        if let IpcMessage::FrameReady {
+                            size,
+                            width: w,
+                            height: h,
+                            keyframe: _,
+                        } = msg
+                        {
+                            // Update dimensions
+                            if w as usize != width || h as usize != height {
+                                log_info(&format!(
+                                    "Frame size changed: {}x{} -> {}x{}",
+                                    width, height, w, h
+                                ));
+                                width = w as usize;
+                                height = h as usize;
+                                encoder = None; // Reset encoder
+                                match Encoder::new() {
+                                    Ok(enc) => encoder = Some(enc),
+                                    Err(e) => log_error(&format!("Failed to create encoder: {}", e)),
+                                }
+                            }
+
+                            // Read Pixels from ShMem
+                            let mut pixels = vec![0u8; size];
+                            {
+                                // Handle PoisonError by using into_inner() or unwrap()
+                                let shmem = match shmem_clone.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                let src = shmem.as_ptr();
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(src, pixels.as_mut_ptr(), size);
+                                }
+                            }
+
+                            // Convert to YUV
+                            let yuv = rgba_to_yuv420(&pixels, width, height);
+                            let yuv_buffer = YUVBuffer::from_vec(yuv, width, height);
+
+                            // Encode
+                            let mut encoded_packet: Option<(Vec<u8>, bool)> = None;
+                            if let Some(ref mut enc) = encoder {
+                                match enc.encode(&yuv_buffer) {
+                                    Ok(bitstream) => {
+                                        let mut data = Vec::new();
+                                        bitstream.write_vec(&mut data);
+                                        let is_keyframe = frame_count % 60 == 0;
+                                        encoded_packet = Some((data, is_keyframe));
+                                    }
+                                    Err(e) => log_error(&format!("H264 encoding error: {}", e)),
+                                }
+                                frame_count += 1;
+                            }
+                            
+                            if let Some(packet) = encoded_packet {
+                                if tx_frame.send(packet).await.is_err() {
+                                    log_error("Failed to enqueue frame for network send");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log_error(&format!("IPC Deserialize Error: {}", e));
+                        break;
+                    }
+                },
                 Err(e) => {
-                    // Log specific errors
-                    let e_str = e.to_string();
-                    if e_str.contains("0x80070005") {
-                        let now = Instant::now();
-                        let should_log = last_access_denied_log
-                            .map(|t| now.duration_since(t) >= Duration::from_secs(5))
-                            .unwrap_or(true);
-                        if should_log {
-                            log_info("Access Denied (Screen Locked / UAC). Waiting...");
-                            last_access_denied_log = Some(now);
-                        }
-                        if !use_fallback {
-                            monitor = None;
-                        }
-                        std::thread::sleep(Duration::from_millis(500));
-                    } else if e_str.contains("0x80070006") {
-                        log_error("DXGI Invalid Handle. Re-initializing...");
-                        monitor = None;
-                        dxgi_error_count += 1;
-                        if dxgi_error_count > MAX_DXGI_ERRORS {
-                            use_fallback = true;
-                            dxgi_error_count = 0;
-                        }
-                    } else if e_str != "No monitor" && e_str != "No screen" {
-                         log_error(&format!("Capture error: {}", e));
-                         monitor = None;
-                         screen = None;
-                         if !use_fallback {
-                             dxgi_error_count += 1;
-                             if dxgi_error_count > MAX_DXGI_ERRORS {
-                                 use_fallback = true;
-                                 dxgi_error_count = 0;
-                             }
-                         }
-                    }
-
-                    // GENERATE DUMMY FRAME (Blue Screen with "No Signal")
-                    // Default to 1280x720 if width/height not set
-                    if width == 0 { width = 1280; }
-                    if height == 0 { height = 720; }
-                    
-                    let mut dummy_pixels = vec![0u8; width * height * 4];
-                    // Fill with Blue (R=0, G=0, B=255, A=255)
-                    for i in 0..width*height {
-                        dummy_pixels[i*4] = 0;
-                        dummy_pixels[i*4+1] = 0;
-                        dummy_pixels[i*4+2] = 255;
-                        dummy_pixels[i*4+3] = 255;
-                    }
-                    
-                    // Re-init encoder if needed (since we might have just set width/height)
-                    if encoder.is_none() {
-                         match Encoder::new() {
-                            Ok(enc) => encoder = Some(enc),
-                            Err(e) => eprintln!("Failed to create encoder: {}", e),
-                        }
-                    }
-                    
-                    (width as u32, height as u32, dummy_pixels)
-                }
-            };
-            
-            // Process Frame (Real or Dummy)
-            if true { // Scope to match previous indentation logic structure
-                // Reset error count on success (if it was a real capture)
-                // Actually, if it was dummy, we shouldn't reset, but for now let's just proceed.
-                
-                if img_w as usize != width || img_h as usize != height {
-                    let now = Instant::now();
-                    let should_log = last_resolution_change_log
-                        .map(|t| now.duration_since(t) >= Duration::from_secs(2))
-                        .unwrap_or(true);
-                    if should_log {
-                        log_info("Resolution changed. Re-initializing...");
-                        last_resolution_change_log = Some(now);
-                    }
-                    if !use_fallback {
-                        monitor = None;
-                        screen = None;
-                    }
-                    width = img_w as usize;
-                    height = img_h as usize;
-                    encoder = None; // Re-create encoder for new resolution
-                    continue;
-                }
-
-                // Convert to YUV420
-                let yuv = rgba_to_yuv420(&pixels, width, height);
-                let yuv_buffer = YUVBuffer::from_vec(yuv, width, height);
-
-                // Encode
-                if let Some(ref mut enc) = encoder {
-                    match enc.encode(&yuv_buffer) {
-                        Ok(bitstream) => {
-                            let mut data = Vec::new();
-                            bitstream.write_vec(&mut data);
-
-                            // Simple keyframe heuristic
-                            let is_keyframe = frame_count % 60 == 0;
-
-                            if tx_frame.blocking_send((data, is_keyframe)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => log_error(&format!("H264 encoding error: {}", e)),
-                    }
-                    frame_count += 1;
+                    log_error(&format!("IPC Read Error: {}", e));
+                    break;
                 }
             }
-            
-            // Frame Pacing
-            let elapsed = capture_start.elapsed();
-            if use_fallback {
-                // GDI: Limit to ~10-15 FPS to save CPU
-                let target_frame_time = Duration::from_millis(66); // ~15 FPS
-                if elapsed < target_frame_time {
-                    std::thread::sleep(target_frame_time - elapsed);
-                }
-            } else {
-                // DXGI: Limit to ~30-60 FPS
-                let target_frame_time = Duration::from_millis(16); // ~60 FPS
-                if elapsed < target_frame_time {
-                    std::thread::sleep(target_frame_time - elapsed);
-                }
+
+            // Pacing (60 FPS)
+            let elapsed = start.elapsed();
+            if elapsed < Duration::from_millis(16) {
+                tokio::time::sleep(Duration::from_millis(16) - elapsed).await;
             }
         }
     });
 
-    // Sender Task
+    // Sender Task (Network)
     let writer_task = tokio::spawn(async move {
         while let Some((data, keyframe)) = rx_frame.recv().await {
             let msg = NetworkMessage::VideoFrame { data, keyframe };
             if let Err(e) = send_message_raw(&mut writer, &crypto_write, &msg).await {
+                // Log and break
                 let e_str = e.to_string().to_lowercase();
-                if e_str.contains("broken pipe")
-                    || e_str.contains("connection reset")
-                    || e_str.contains("connection aborted")
-                    || e_str.contains("early eof")
-                    || e_str.contains("unexpected end of file")
+                if !e_str.contains("broken pipe")
+                    && !e_str.contains("connection reset")
                 {
-                    log_info(&format!("Client disconnected while sending frame: {}", e));
-                } else {
                     log_error(&format!("Failed to send frame: {}", e));
                 }
                 break;
@@ -1240,30 +1230,32 @@ async fn handle_client(mut socket: TcpStream) -> Result<()> {
         }
     });
 
-    // Input Receiver Task
+    // Input Receiver Task (Network -> IPC)
+    let pipe_input = pipe.clone();
     let reader_task = tokio::spawn(async move {
-        let mut enigo = Enigo::new(&Settings::default()).unwrap();
-        let _buf = [0u8; 1024 * 1024]; // 1MB buffer
         loop {
             match read_message_raw(&mut reader, &crypto_read).await {
                 Ok(msg) => match msg {
                     NetworkMessage::Input(event) => {
-                        process_input(&mut enigo, event);
+                        // Forward to Agent via IPC
+                        let ipc_msg = IpcMessage::Input(event);
+                        if let Ok(bytes) = serde_json::to_vec(&ipc_msg) {
+                            let mut p = pipe_input.lock().await;
+                            // Just write, no response expected
+                            if let Err(e) = p.write_u32(bytes.len() as u32).await {
+                                log_error(&format!("IPC Input write length failed: {}", e));
+                                break;
+                            }
+                            if let Err(e) = p.write_all(&bytes).await {
+                                log_error(&format!("IPC Input write failed: {}", e));
+                                break;
+                            }
+                        }
                     }
                     _ => {}
                 },
                 Err(e) => {
-                    let e_str = e.to_string().to_lowercase();
-                    if e_str.contains("early eof")
-                        || e_str.contains("unexpected end of file")
-                        || e_str.contains("broken pipe")
-                        || e_str.contains("connection reset")
-                        || e_str.contains("connection aborted")
-                    {
-                        log_info(&format!("Client disconnected: {}", e));
-                    } else {
-                        log_error(&format!("Client disconnected or error: {}", e));
-                    }
+                    log_error(&format!("Network input read error: {}", e));
                     break;
                 }
             }
@@ -1273,77 +1265,6 @@ async fn handle_client(mut socket: TcpStream) -> Result<()> {
     let _ = tokio::join!(writer_task, reader_task);
 
     Ok(())
-}
-
-fn process_input(enigo: &mut Enigo, event: InputEvent) {
-    match event {
-        InputEvent::MouseMove { x, y } => {
-            let _ = enigo.move_mouse(x, y, Coordinate::Abs);
-        }
-        InputEvent::MouseDown { button } => {
-            let _ = enigo.button(convert_button(button), Direction::Press);
-        }
-        InputEvent::MouseUp { button } => {
-            let _ = enigo.button(convert_button(button), Direction::Release);
-        }
-        InputEvent::KeyDown { key } => {
-            let _ = enigo.key(convert_key(key), Direction::Press);
-        }
-        InputEvent::KeyUp { key } => {
-            let _ = enigo.key(convert_key(key), Direction::Release);
-        }
-        InputEvent::Scroll {
-            delta_x: _,
-            delta_y,
-        } => {
-            let _ = enigo.scroll(delta_y, Axis::Vertical);
-        }
-    }
-}
-
-fn convert_key(k: RemoteKey) -> Key {
-    match k {
-        RemoteKey::Char(c) => Key::Unicode(c),
-        RemoteKey::Space => Key::Space,
-        RemoteKey::Enter => Key::Return,
-        RemoteKey::Backspace => Key::Backspace,
-        RemoteKey::Tab => Key::Tab,
-        RemoteKey::Escape => Key::Escape,
-        RemoteKey::Shift => Key::Shift,
-        RemoteKey::Control => Key::Control,
-        RemoteKey::Alt => Key::Alt,
-        RemoteKey::Delete => Key::Delete,
-        RemoteKey::Home => Key::Home,
-        RemoteKey::End => Key::End,
-        RemoteKey::PageUp => Key::PageUp,
-        RemoteKey::PageDown => Key::PageDown,
-        RemoteKey::Up => Key::UpArrow,
-        RemoteKey::Down => Key::DownArrow,
-        RemoteKey::Left => Key::LeftArrow,
-        RemoteKey::Right => Key::RightArrow,
-        RemoteKey::F1 => Key::F1,
-        RemoteKey::F2 => Key::F2,
-        RemoteKey::F3 => Key::F3,
-        RemoteKey::F4 => Key::F4,
-        RemoteKey::F5 => Key::F5,
-        RemoteKey::F6 => Key::F6,
-        RemoteKey::F7 => Key::F7,
-        RemoteKey::F8 => Key::F8,
-        RemoteKey::F9 => Key::F9,
-        RemoteKey::F10 => Key::F10,
-        RemoteKey::F11 => Key::F11,
-        RemoteKey::F12 => Key::F12,
-        RemoteKey::Windows => Key::Meta,
-    }
-}
-
-fn convert_button(b: MouseButton) -> Button {
-    match b {
-        MouseButton::Left => Button::Left,
-        MouseButton::Right => Button::Right,
-        MouseButton::Middle => Button::Middle,
-        MouseButton::Other(_) => Button::Left,
-    }
 }
 
 async fn send_message(socket: &mut TcpStream, crypto: &Crypto, msg: &NetworkMessage) -> Result<()> {
